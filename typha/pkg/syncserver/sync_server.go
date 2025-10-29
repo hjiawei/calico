@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/golang/snappy"
+	"github.com/klauspost/compress/zstd"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
@@ -105,6 +106,13 @@ const (
 	defaultShutdownTimeout                = 300 * time.Second
 	defaultMaxConns                       = math.MaxInt32
 	PortRandom                            = -1
+)
+
+var (
+	serverPreferredCompressionAlgorithmOrder = []syncproto.CompressionAlgorithm{
+		syncproto.CompressionSnappy,
+		syncproto.CompressionZstd,
+	}
 )
 
 type Server struct {
@@ -293,9 +301,11 @@ func New(caches map[syncproto.SyncerType]BreadcrumbProvider, config Config) *Ser
 	}
 
 	s.binSnapCaches[syncproto.CompressionSnappy] = map[syncproto.SyncerType]snapshotCache{}
+	s.binSnapCaches[syncproto.CompressionZstd] = map[syncproto.SyncerType]snapshotCache{}
 	for st, cache := range caches {
 		s.perSyncerConnMetrics[st] = makePerSyncerConnMetrics(st)
 		s.binSnapCaches[syncproto.CompressionSnappy][st] = NewSnappySnapCache(string(st), cache, config.BinarySnapshotTimeout, config.WriteTimeout)
+		s.binSnapCaches[syncproto.CompressionZstd][st] = NewZstdSnapCache(string(st), cache, config.BinarySnapshotTimeout, config.WriteTimeout)
 	}
 
 	// Register that we will report liveness.
@@ -927,10 +937,14 @@ func (h *connection) doHandshake() error {
 	}
 	h.cache = desiredSyncerCache
 
+	clientSupportedCompressionAlgorithms := make(map[syncproto.CompressionAlgorithm]bool, len(hello.SupportedCompressionAlgorithms))
 	for _, alg := range hello.SupportedCompressionAlgorithms {
-		switch alg {
-		case syncproto.CompressionSnappy:
-			h.chosenCompression = syncproto.CompressionSnappy
+		clientSupportedCompressionAlgorithms[alg] = true
+	}
+	for _, alg := range serverPreferredCompressionAlgorithmOrder {
+		if clientSupportedCompressionAlgorithms[alg] {
+			h.chosenCompression = alg
+			break
 		}
 	}
 	h.clientSupportsDecoderRestart = hello.SupportsDecoderRestart
@@ -999,8 +1013,19 @@ func (h *connection) waitForAckAndRestartEncoder() error {
 		w := snappy.NewBufferedWriter(bw)
 		h.encoder = gob.NewEncoder(w) // Need a new Encoder, there's no way to change out the Writer.
 		h.flushWriter = func() error {
-			err := w.Flush()
-			if err != nil {
+			if err := w.Flush(); err != nil {
+				return err
+			}
+			return bw.Flush()
+		}
+	case syncproto.CompressionZstd:
+		w, err := zstd.NewWriter(bw, zstd.WithEncoderLevel(zstd.SpeedFastest))
+		if err != nil {
+			return err
+		}
+		h.encoder = gob.NewEncoder(w)
+		h.flushWriter = func() error {
+			if err := w.Flush(); err != nil {
 				return err
 			}
 			return bw.Flush()

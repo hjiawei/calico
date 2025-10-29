@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/golang/snappy"
+	"github.com/klauspost/compress/zstd"
 	log "github.com/sirupsen/logrus"
 
 	calicotls "github.com/projectcalico/calico/crypto/pkg/tls"
@@ -452,7 +453,7 @@ func (s *SyncerClient) loop(cxt context.Context, cancelFn context.CancelFunc, co
 	if ourSyncerType == "" {
 		ourSyncerType = syncproto.SyncerTypeFelix
 	}
-	compAlgs := []syncproto.CompressionAlgorithm{syncproto.CompressionSnappy}
+	compAlgs := []syncproto.CompressionAlgorithm{syncproto.CompressionSnappy, syncproto.CompressionZstd}
 	if s.options.DisableDecoderRestart {
 		// Compression requires decoder restart.
 		compAlgs = nil
@@ -579,6 +580,14 @@ func (s *SyncerClient) restartDecoder(cxt context.Context, logCxt *log.Entry, ms
 	case syncproto.CompressionSnappy:
 		logCxt.Info("Server selected snappy compression.")
 		r := snappy.NewReader(s.connR)
+		s.decoder = gob.NewDecoder(r)
+	case syncproto.CompressionZstd:
+		logCxt.Info("Server selected zstd compression.")
+		r, err := zstd.NewReader(s.connR)
+		if err != nil {
+			logCxt.WithError(err).Error("Failed to create zstd reader")
+			return err
+		}
 		s.decoder = gob.NewDecoder(r)
 	case "":
 		logCxt.Info("Server selected no compression.")
